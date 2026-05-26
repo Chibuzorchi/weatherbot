@@ -214,16 +214,10 @@ def execute_buy(config: dict, token_id: str, price: float, size_usd: float,
     Returns the response dict from CLOB on success, None on failure.
     Always logs the attempt regardless of outcome.
 
+    Dry-run mode logs the order but skips risk checks (size limits are for real money only).
+
     THIS WILL SPEND REAL USDC if LIVE_TRADING=true and dry_run=false.
     """
-    allowed, reason = check_can_open(config, state, open_positions, size_usd)
-    if not allowed:
-        _log_order("buy_rejected", {
-            "token_id": token_id, "price": price, "size_usd": size_usd, "reason": reason,
-        })
-        print(f"  [LIVE-SKIP] BUY {token_id[:8]} rejected: {reason}")
-        return None
-
     shares = round(size_usd / price, 2)
 
     if config.get("live_dry_run_first", True):
@@ -232,6 +226,15 @@ def execute_buy(config: dict, token_id: str, price: float, size_usd: float,
         })
         print(f"  [DRY-RUN] BUY {shares:.2f} shares @ ${price:.3f} = ${size_usd:.2f}")
         return {"dry_run": True, "shares": shares, "price": price, "size_usd": size_usd}
+
+    # === RISK CHECKS (real money only) ===
+    allowed, reason = check_can_open(config, state, open_positions, size_usd)
+    if not allowed:
+        _log_order("buy_rejected", {
+            "token_id": token_id, "price": price, "size_usd": size_usd, "reason": reason,
+        })
+        print(f"  [LIVE-SKIP] BUY {token_id[:8]} rejected: {reason}")
+        return None
 
     # === REAL ORDER PLACEMENT ===
     # This block only runs when LIVE_TRADING=true AND live_dry_run_first=false.

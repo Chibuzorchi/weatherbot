@@ -37,8 +37,14 @@ from weatherbot.common import (
     info, ok, skip, warn,
     load_config, load_env_file,
     parse_temp_range, hours_until, in_bucket, bucket_prob, calc_ev, calc_kelly,
+    format_bucket,
     get_polymarket_event, get_polymarket_market, parse_outcome_prices,
 )
+
+try:
+    from weatherbot import live_trading as _live
+except ImportError:
+    _live = None
 
 # ---------------------------------------------------------------------------
 # Config
@@ -51,6 +57,7 @@ BALANCE          = float(_cfg.get("balance", 10000.0))
 MAX_BET          = float(_cfg.get("v2_max_bet", 20.0))
 MIN_EV           = float(_cfg.get("v2_min_ev", 0.10))
 MAX_PRICE        = float(_cfg.get("v2_max_price", 0.45))
+MIN_PRICE        = float(_cfg.get("v2_min_price", 0.05))
 MIN_VOLUME       = float(_cfg.get("v2_min_volume", 500))
 MIN_HOURS        = float(_cfg.get("v2_min_hours", 2.0))
 MAX_HOURS        = float(_cfg.get("v2_max_hours", 72.0))
@@ -59,6 +66,8 @@ MAX_SLIPPAGE     = float(_cfg.get("v2_max_slippage", 0.03))
 SCAN_INTERVAL    = int(_cfg.get("v2_scan_interval", 3600))
 MONITOR_INTERVAL = int(_cfg.get("v2_monitor_interval", 600))
 CALIBRATION_MIN  = int(_cfg.get("v2_calibration_min", 30))
+MAX_OPEN_POSITIONS = int(_cfg.get("v2_max_open_positions", 8))
+MAX_DRAWDOWN_PCT  = float(_cfg.get("v2_max_drawdown_pct", 0.60))
 LOCATIONS_ALL    = bool(_cfg.get("v2_locations_all", True))
 
 # Pull VC_KEY from env first, then config (env wins).
@@ -519,7 +528,7 @@ def scan_and_update() -> tuple[int, int, int]:
             top = max(outcomes, key=lambda x: x["price"]) if outcomes else None
             mkt["market_snapshots"].append({
                 "ts":         snap.get("ts"),
-                "top_bucket": f"{top['range'][0]}-{top['range'][1]}{unit_sym}" if top else None,
+                "top_bucket": format_bucket(top['range'][0], top['range'][1], unit_sym) if top else None,
                 "top_price":  top["price"] if top else None,
             })
 
@@ -577,6 +586,13 @@ def scan_and_update() -> tuple[int, int, int]:
                                 forecast_shifted = (forecast_temp < bl - buf) or (forecast_temp > bh + buf)
 
                     if take_triggered or stop_triggered or forecast_shifted:
+                        if _live is not None and _live.is_live_trading_enabled():
+                            _live.execute_sell(
+                                config=_cfg,
+                                token_id=pos["market_id"],
+                                price=current_price,
+                                shares=pos["shares"],
+                            )
                         pnl = round((current_price - entry) * pos["shares"], 2)
                         balance += pos["cost"] + pnl
                         pos["closed_at"] = snap.get("ts") or datetime.now(timezone.utc).isoformat()
@@ -592,11 +608,13 @@ def scan_and_update() -> tuple[int, int, int]:
                         else:
                             reason, label = "trailing_stop", "TRAILING"
                         pos["close_reason"] = reason
-                        # Update wins/losses based on PnL sign (>0 = win, <=0 = loss/breakeven)
                         if pnl > 0:
                             state["wins"] += 1
                         else:
                             state["losses"] += 1
+                            today_str = now.strftime("%Y-%m-%d")
+                            state.setdefault("daily_pnl", {})
+                            state["daily_pnl"][today_str] = state["daily_pnl"].get(today_str, 0.0) + pnl
                         closed += 1
                         sign = "+" if pnl >= 0 else ""
                         print(f"\n  [{label}] {loc['name']} {date} | "
@@ -614,11 +632,24 @@ def scan_and_update() -> tuple[int, int, int]:
                     p = bucket_prob(forecast_temp, t_low, t_high, sigma)
                     ev = calc_ev(p, ask)
 
-                    if ev >= MIN_EV and ask < MAX_PRICE and spread <= MAX_SLIPPAGE:
+                    if ev >= MIN_EV and ask >= MIN_PRICE and ask < MAX_PRICE and spread <= MAX_SLIPPAGE:
                         kelly = calc_kelly(p, ask, KELLY_FRACTION)
                         size = bet_size(kelly, balance)
 
                         if size >= 0.50:
+                            # --- safety: max open positions ---
+                            open_count = len([m for m in load_all_markets()
+                                              if m.get("position") and m["position"].get("status") == "open"])
+                            if open_count >= MAX_OPEN_POSITIONS:
+                                print()  # no newline
+                                continue
+
+                            # --- safety: drawdown kill switch ---
+                            starting = state.get("starting_balance", BALANCE)
+                            if balance < starting * (1 - MAX_DRAWDOWN_PCT):
+                                warn(f"Drawdown limit {MAX_DRAWDOWN_PCT:.0%} reached ($-{starting - balance:.0f}) - halting new positions")
+                                return new_pos, closed, resolved
+
                             # re-fetch live book to be sure we don't trade stale prices
                             live = fetch_real_book(matched["market_id"])
                             if live:
@@ -626,7 +657,7 @@ def scan_and_update() -> tuple[int, int, int]:
                                 bid = live.get("bid") or bid
                                 spread = live.get("spread") or spread
 
-                            if spread <= MAX_SLIPPAGE and ask < MAX_PRICE:
+                            if spread <= MAX_SLIPPAGE and ask >= MIN_PRICE and ask < MAX_PRICE:
                                 shares = round(size / ask, 2)
                                 signal = {
                                     "market_id":     matched["market_id"],
@@ -652,12 +683,30 @@ def scan_and_update() -> tuple[int, int, int]:
                                     "close_reason":  None,
                                     "closed_at":     None,
                                 }
+
+                                # --- live trading ---
+                                if _live is not None and _live.is_live_trading_enabled():
+                                    open_positions = [m for m in load_all_markets()
+                                                      if m.get("position") and m["position"].get("status") == "open"]
+                                    live_resp = _live.execute_buy(
+                                        config=_cfg,
+                                        token_id=signal["market_id"],
+                                        price=signal["entry_price"],
+                                        size_usd=signal["cost"],
+                                        state=state,
+                                        open_positions=[p["position"] for p in open_positions],
+                                    )
+                                    if live_resp is None:
+                                        save_market(mkt)
+                                        time.sleep(0.1)
+                                        continue
+
                                 balance -= size
                                 mkt["position"] = signal
                                 state["total_trades"] += 1
                                 new_pos += 1
                                 src = (best_source or "?").upper()
-                                bucket = f"{t_low}-{t_high}{unit_sym}"
+                                bucket = format_bucket(t_low, t_high, unit_sym)
                                 print(f"\n  [BUY]  {loc['name']} {horizon} {date} | {bucket} | "
                                       f"${ask:.3f} | EV {signal['ev']:+.2f} | "
                                       f"${size:.2f} ({src})")
@@ -699,6 +748,9 @@ def scan_and_update() -> tuple[int, int, int]:
                     state["wins"] += 1
                 else:
                     state["losses"] += 1
+                    today_str = now.strftime("%Y-%m-%d")
+                    state.setdefault("daily_pnl", {})
+                    state["daily_pnl"][today_str] = state["daily_pnl"].get(today_str, 0.0) + pnl
                 resolved += 1
                 sign = "+" if pnl >= 0 else ""
                 print(f"  [{('WIN' if won else 'LOSS')}] {mkt['city_name']} {mkt['date']} | PnL: {sign}{pnl:.2f}")
@@ -727,6 +779,10 @@ def scan_and_update() -> tuple[int, int, int]:
                 state["wins"] += 1
             else:
                 state["losses"] += 1
+                if (pos.get("pnl") or 0) < 0:
+                    today_str = now.strftime("%Y-%m-%d")
+                    state.setdefault("daily_pnl", {})
+                    state["daily_pnl"][today_str] = state["daily_pnl"].get(today_str, 0.0) + pos.get("pnl", 0)
             resolved += 1
             save_market(mkt)
         time.sleep(0.2)
@@ -793,6 +849,13 @@ def monitor_positions() -> int:
         if not (take_t or stop_t):
             continue
 
+        if _live is not None and _live.is_live_trading_enabled():
+            _live.execute_sell(
+                config=_cfg,
+                token_id=pos["market_id"],
+                price=current,
+                shares=pos["shares"],
+            )
         pnl = round((current - entry) * pos["shares"], 2)
         balance += pos["cost"] + pnl
         pos["closed_at"] = datetime.now(timezone.utc).isoformat()
@@ -809,6 +872,9 @@ def monitor_positions() -> int:
             state["wins"] += 1
         else:
             state["losses"] += 1
+            today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            state.setdefault("daily_pnl", {})
+            state["daily_pnl"][today_str] = state["daily_pnl"].get(today_str, 0.0) + pnl
         closed += 1
         sign = "+" if pnl >= 0 else ""
         print(f"  [{label}] {city_name} {mkt['date']} | "
@@ -855,7 +921,7 @@ def print_status() -> None:
         for m in open_pos:
             pos = m["position"]
             unit_sym = m["unit"]
-            label = f"{pos['bucket_low']}-{pos['bucket_high']}{unit_sym}"
+            label = format_bucket(pos['bucket_low'], pos['bucket_high'], unit_sym)
             current = pos["entry_price"]
             for o in m.get("all_outcomes", []):
                 if o["market_id"] == pos["market_id"]:
@@ -966,13 +1032,29 @@ def run_loop() -> None:
         print("\n  Stopping - state already saved each cycle. Bye.")
 
 
+def _is_live_real() -> bool:
+    """True only when LIVE_TRADING=true AND live_dry_run_first=false (real money at risk)."""
+    return (_live is not None
+            and _live.is_live_trading_enabled()
+            and not bool(_cfg.get("live_dry_run_first", True)))
+
+
+def _auto_reset_if_paper() -> None:
+    """Clear state on startup unless real money is at stake."""
+    if _is_live_real():
+        return
+    reset_state()
+
+
 def main() -> int:
     cmd = sys.argv[1].lower() if len(sys.argv) > 1 else "run"
     global _cal
 
     if cmd == "run":
+        _auto_reset_if_paper()
         run_loop()
     elif cmd == "once":
+        _auto_reset_if_paper()
         _cal = load_cal()
         print(f"[{datetime.now().strftime('%H:%M:%S')}] single full scan...")
         new_pos, closed, resolved = scan_and_update()

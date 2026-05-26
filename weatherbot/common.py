@@ -145,6 +145,17 @@ def in_bucket(forecast: float, t_low: float, t_high: float) -> bool:
     return t_low <= float(forecast) <= t_high
 
 
+def format_bucket(low: float, high: float, unit: str = "F") -> str:
+    """Human-readable bucket string. Sentinel values -999/999 become <X or >X."""
+    if low == -999:
+        return f"<{int(high)}°{unit}"
+    if high == 999:
+        return f">{int(low)}°{unit}"
+    if round(low) == round(high):
+        return f"{int(round(low))}°{unit}"
+    return f"{int(low)}-{int(high)}°{unit}"
+
+
 def bucket_prob(forecast: float, t_low: float, t_high: float, sigma: float = 2.0) -> float:
     """
     Probability the forecast lands in [t_low, t_high].

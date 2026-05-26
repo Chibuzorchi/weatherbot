@@ -215,3 +215,6 @@ simulation.json
 .vscode/
 .idea/
 *.swp
+.opencode
+.claude
+
